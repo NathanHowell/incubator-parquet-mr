@@ -1,5 +1,6 @@
 /**
  * Copyright 2012 Twitter, Inc.
+ * Copyright 2014 GoDaddy, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +27,10 @@ import java.util.Map;
 import parquet.Log;
 import parquet.column.ColumnReader;
 import parquet.column.impl.ColumnReadStoreImpl;
+import parquet.io.ParquetEncodingException;
+import parquet.io.RecordConsumerLoggingWrapper;
+import parquet.io.RecordReader;
+import parquet.io.ValidatingRecordConsumer;
 import parquet.io.api.Converter;
 import parquet.io.api.GroupConverter;
 import parquet.io.api.PrimitiveConverter;
@@ -104,7 +109,7 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
         return equals((Case)obj);
       }
       return false;
-    };
+    }
 
     // see comment for hashCode above
 //    public boolean equals(Case other) {
@@ -192,18 +197,20 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
     private List<Case> undefinedCases;
 
     private State(int id, PrimitiveColumnIO primitiveColumnIO, ColumnReader column, int[] nextLevel, GroupConverter[] groupConverterPath, PrimitiveConverter primitiveConverter) {
+      final ColumnPath logicalPath = primitiveColumnIO.getLeafInfo().getLogicalPath();
+      final ColumnPath physicalPath = primitiveColumnIO.getLeafInfo().getPhysicalPath();
       this.id = id;
       this.primitiveColumnIO = primitiveColumnIO;
-      this.maxDefinitionLevel = primitiveColumnIO.getDefinitionLevel();
-      this.maxRepetitionLevel = primitiveColumnIO.getRepetitionLevel();
+      this.maxDefinitionLevel = physicalPath.getDefinitionLevel();
+      this.maxRepetitionLevel = physicalPath.getRepetitionLevel();
       this.column = column;
       this.nextLevel = nextLevel;
       this.groupConverterPath = groupConverterPath;
       this.primitiveConverter = primitiveConverter;
       this.primitive = primitiveColumnIO.getType().asPrimitiveType().getPrimitiveTypeName();
-      this.fieldPath = primitiveColumnIO.getFieldPath();
+      this.fieldPath = logicalPath.getPath();
       this.primitiveField = fieldPath[fieldPath.length - 1];
-      this.indexFieldPath = primitiveColumnIO.getIndexFieldPath();
+      this.indexFieldPath = logicalPath.getIndexes();
       this.primitiveFieldIndex = indexFieldPath[indexFieldPath.length - 1];
     }
 
@@ -232,7 +239,7 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
   private final RecordMaterializer<T> recordMaterializer;
 
   private State[] states;
-  private ColumnReader[] columnReaders;
+  private final ColumnReader[] columnReaders;
 
   /**
    * @param root the root of the schema
@@ -243,7 +250,7 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
   public RecordReaderImplementation(MessageColumnIO root, RecordMaterializer<T> recordMaterializer, boolean validating, ColumnReadStoreImpl columnStore) {
     this.recordMaterializer = recordMaterializer;
     this.recordRootConverter = recordMaterializer.getRootConverter(); // TODO: validator(wrap(recordMaterializer), validating, root.getType());
-    PrimitiveColumnIO[] leaves = root.getLeaves().toArray(new PrimitiveColumnIO[root.getLeaves().size()]);
+    PrimitiveColumnIO[] leaves = root.getLeafColumnIO().toArray(new PrimitiveColumnIO[root.getLeafColumnIO().size()]);
     columnReaders = new ColumnReader[leaves.length];
     int[][] nextColumnIdxForRepLevel = new int[leaves.length][];
     int[][] levelToClose = new int[leaves.length][];
@@ -254,7 +261,7 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
     for (int i = 0; i < leaves.length; i++) {
       PrimitiveColumnIO leafColumnIO = leaves[i];
       //generate converters along the path from root to leaf
-      final int[] indexFieldPath = leafColumnIO.getIndexFieldPath();
+      final int[] indexFieldPath = leafColumnIO.getLeafInfo().getLogicalPath().getIndexes();
       groupConverterPaths[i] = new GroupConverter[indexFieldPath.length - 1];
       GroupConverter current = this.recordRootConverter;
       for (int j = 0; j < indexFieldPath.length - 1; j++) {
@@ -262,8 +269,8 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
         groupConverterPaths[i][j] = current;
       }
       leafConverters[i] = current.getConverter(indexFieldPath[indexFieldPath.length - 1]).asPrimitiveConverter();
-      columnReaders[i] = columnStore.getColumnReader(leafColumnIO.getColumnDescriptor());
-      int maxRepetitionLevel = leafColumnIO.getRepetitionLevel();
+      columnReaders[i] = columnStore.getColumnReader(leafColumnIO.getLeafInfo().getPhysicalPath().getColumnDescriptor(), leafColumnIO.getLeafInfo().getLogicalPath().getColumnDescriptor());
+      int maxRepetitionLevel = leafColumnIO.getLeafInfo().getLogicalPath().getRepetitionLevel();
       nextColumnIdxForRepLevel[i] = new int[maxRepetitionLevel+1];
 
       levelToClose[i] = new int[maxRepetitionLevel+1]; //next level
@@ -286,16 +293,16 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
         if (nextColIdx == leaves.length) { // reached the end of the record => close all levels
           levelToClose[i][nextRepLevel] = 0;
         } else if (leafColumnIO.isLast(nextRepLevel)) { // reached the end of this level => close the repetition level
-          ColumnIO parent = leafColumnIO.getParent(nextRepLevel);
-          levelToClose[i][nextRepLevel] = parent.getFieldPath().length - 1;
+          ColumnIO<?> parent = leafColumnIO.getParent(nextRepLevel);
+          levelToClose[i][nextRepLevel] = parent.getLeafInfo().getLogicalPath().getPath().length - 1;
         } else { // otherwise close until the next common parent
           levelToClose[i][nextRepLevel] = getCommonParentLevel(
-              leafColumnIO.getFieldPath(),
-              leaves[nextColIdx].getFieldPath());
+              leafColumnIO.getLeafInfo().getLogicalPath().getPath(),
+              leaves[nextColIdx].getLeafInfo().getLogicalPath().getPath());
         }
         // sanity check: that would be a bug
-        if (levelToClose[i][nextRepLevel] > leaves[i].getFieldPath().length-1) {
-          throw new ParquetEncodingException(Arrays.toString(leaves[i].getFieldPath())+" -("+nextRepLevel+")-> "+levelToClose[i][nextRepLevel]);
+        if (levelToClose[i][nextRepLevel] > leaves[i].getLeafInfo().getLogicalPath().getPath().length-1) {
+          throw new ParquetEncodingException(Arrays.toString(leaves[i].getLeafInfo().getLogicalPath().getPath())+" -("+nextRepLevel+")-> "+levelToClose[i][nextRepLevel]);
         }
         nextColumnIdxForRepLevel[i][nextRepLevel] = nextColIdx;
       }
@@ -304,13 +311,13 @@ class RecordReaderImplementation<T> extends RecordReader<T> {
     for (int i = 0; i < leaves.length; i++) {
       states[i] = new State(i, leaves[i], columnReaders[i], levelToClose[i], groupConverterPaths[i], leafConverters[i]);
 
-      int[] definitionLevelToDepth = new int[states[i].primitiveColumnIO.getDefinitionLevel() + 1];
+      int[] definitionLevelToDepth = new int[states[i].primitiveColumnIO.getLeafInfo().getLogicalPath().getDefinitionLevel() + 1];
       // for each possible definition level, determine the depth at which to create groups
-      final ColumnIO[] path = states[i].primitiveColumnIO.getPath();
+      final ColumnIO[] path = states[i].primitiveColumnIO.getColumnPath();
       int depth = 0;
       for (int d = 0; d < definitionLevelToDepth.length; ++d) {
         while (depth < (states[i].fieldPath.length - 1)
-          && d >= path[depth + 1].getDefinitionLevel()
+          && d >= path[depth + 1].getLeafInfo().getLogicalPath().getDefinitionLevel()
           ) {
           ++ depth;
         }

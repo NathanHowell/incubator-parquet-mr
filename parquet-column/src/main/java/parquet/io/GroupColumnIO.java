@@ -1,5 +1,5 @@
 /**
- * Copyright 2012 Twitter, Inc.
+ * Copyright 2014 GoDaddy, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,105 +15,51 @@
  */
 package parquet.io;
 
-import static parquet.schema.Type.Repetition.REPEATED;
-import static parquet.schema.Type.Repetition.REQUIRED;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-import parquet.Log;
 import parquet.schema.GroupType;
 
-/**
- * Group level of the IO structure
- *
- *
- * @author Julien Le Dem
- *
- */
-public class GroupColumnIO extends ColumnIO {
-  private static final Log LOG = Log.getLog(GroupColumnIO.class);
+import java.util.ArrayList;
+import java.util.List;
 
-  private final Map<String, ColumnIO> childrenByName = new HashMap<String, ColumnIO>();
-  private final List<ColumnIO> children = new ArrayList<ColumnIO>();
-  private int childrenSize = 0;
+public class GroupColumnIO<T extends GroupType> extends ColumnIO<T> {
+  private final List<ColumnIO<?>> children;
 
-  GroupColumnIO(GroupType groupType, GroupColumnIO parent, int index) {
-    super(groupType, parent, index);
-  }
-
-  void add(ColumnIO child) {
-    children.add(child);
-    childrenByName.put(child.getType().getName(), child);
-    ++ childrenSize;
+  public GroupColumnIO(
+      final T type,
+      final String name,
+      final LeafInfo leafInfo,
+      final List<ColumnIO<?>> children) {
+    super(type, name, leafInfo);
+    this.children = children;
   }
 
   @Override
-  void setLevels(int r, int d, String[] fieldPath, int[] indexFieldPath, List<ColumnIO> repetition, List<ColumnIO> path) {
-    super.setLevels(r, d, fieldPath, indexFieldPath, repetition, path);
-    for (ColumnIO child : this.children) {
-      String[] newFieldPath = Arrays.copyOf(fieldPath, fieldPath.length + 1);
-      int[] newIndexFieldPath = Arrays.copyOf(indexFieldPath, indexFieldPath.length + 1);
-      newFieldPath[fieldPath.length] = child.getType().getName();
-      newIndexFieldPath[indexFieldPath.length] = child.getIndex();
-      List<ColumnIO> newRepetition;
-      if (child.getType().isRepetition(REPEATED)) {
-        newRepetition = new ArrayList<ColumnIO>(repetition);
-        newRepetition.add(child);
-      } else {
-        newRepetition = repetition;
-      }
-      List<ColumnIO> newPath = new ArrayList<ColumnIO>(path);
-      newPath.add(child);
-      child.setLevels(
-          // the type repetition level increases whenever there's a possible repetition
-          child.getType().isRepetition(REPEATED) ? r + 1 : r,
-          // the type definition level increases whenever a field can be missing (not required)
-          !child.getType().isRepetition(REQUIRED) ? d + 1 : d,
-          newFieldPath,
-          newIndexFieldPath,
-          newRepetition,
-          newPath
-          );
-
+  void setParent(final ColumnIO<?> parent) {
+    super.setParent(parent);
+    for (final ColumnIO<?> child : children) {
+      child.setParent(this);
     }
   }
 
   @Override
-  List<String[]> getColumnNames() {
-    ArrayList<String[]> result = new ArrayList<String[]>();
-    for (ColumnIO c : children) {
-      result.addAll(c.getColumnNames());
-    }
-    return result;
-  }
-
   PrimitiveColumnIO getLast() {
-    return children.get(children.size()-1).getLast();
+    return children.get(children.size() - 1).getLast();
   }
 
+  @Override
   PrimitiveColumnIO getFirst() {
     return children.get(0).getFirst();
   }
 
-  public ColumnIO getChild(String name) {
-    return childrenByName.get(name);
+  public List<ColumnIO<?>> getChildren() {
+    return children;
   }
 
-  public ColumnIO getChild(int fieldIndex) {
-    try {
-      return children.get(fieldIndex);
-    } catch (IndexOutOfBoundsException e) {
-      throw new InvalidRecordException("could not get child " + fieldIndex + " from " + children, e);
+  @Override
+  public final List<PrimitiveColumnIO> getLeafColumnIO() {
+    final ArrayList<PrimitiveColumnIO> arr = new ArrayList<PrimitiveColumnIO>();
+    for (final ColumnIO<?> child : children) {
+      arr.addAll(child.getLeafColumnIO());
     }
+    return arr;
   }
-
-  public int getChildrenCount() {
-    return childrenSize;
-
-  }
-
 }

@@ -1,5 +1,6 @@
 /**
  * Copyright 2012 Twitter, Inc.
+ * Copyright 2014 GoDaddy, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,129 +16,322 @@
  */
 package parquet.io;
 
-import static parquet.schema.Type.Repetition.REQUIRED;
-
-import java.util.ArrayList;
-import java.util.List;
-
 import parquet.schema.GroupType;
 import parquet.schema.MessageType;
 import parquet.schema.PrimitiveType;
 import parquet.schema.Type;
 import parquet.schema.TypeVisitor;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 /**
- * Factory constructing the ColumnIO structure from the schema
+ * Factory that supports type coercions in two directions:
  *
- * @author Julien Le Dem
+ * a) Lifting
+ * b) Extracted
  *
+ * Lifting conversions allow a requested schema to have additional
+ * nodes compared to the file schema assuming that the leaf nodes
+ * maintain invariants around repetition and definition counts.
+ * This mode is primarily meant to allow Pig and Hive to load
+ * files that were written using parquet-protobuf or some other
+ * writer that does not have a first class notion of nullable values
+ * but it needs to be read into a schema that does. These conversions
+ * are safe at runtime as they do not lose or discard any information.
+ *
+ * Extracted conversions go the other direction. Such conversions
+ * are not always safe at runtime and are disabled by default.
  */
 public class ColumnIOFactory {
+  Option<GroupColumnIO<GroupType>> groupType(
+      final GroupType fileGroupType,
+      final GroupType requestedGroupType,
+      final LeafInfo leafInfo) {
 
-  public class ColumnIOCreatorVisitor implements TypeVisitor {
+    // find suitable matching nodes in the disk schema for
+    // for each child node in the requested schema
+    final ArrayList<ColumnIO<?>> children = new ArrayList<ColumnIO<?>>(requestedGroupType.getFieldCount());
+    final List<Type> requestedFields = requestedGroupType.getFields();
+    for (int i = 0; i < requestedGroupType.getFieldCount(); ++i) {
+      final int ii = i;
+      final Type requestedField = requestedFields.get(ii);
 
-    private MessageColumnIO columnIO;
-    private GroupColumnIO current;
-    private List<PrimitiveColumnIO> leaves = new ArrayList<PrimitiveColumnIO>();
-    private final boolean validating;
-    private final MessageType requestedSchema;
-    private int currentRequestedIndex;
-    private Type currentRequestedType;
+      // attempt various matching strategies until the first match is returned using a breadth first
+      // search. this doesn't guarantee that the best match is found, just a suitable match.
+      Option
+          .<ColumnIO<?>>empty()
+          .or(new Function<Void, Option<ColumnIO<?>>>() {
+            @Override
+            public Option<ColumnIO<?>> call(Void unit) {
+              // a field name matches, check to see if the schemas are compatible
+              if (!fileGroupType.containsField(requestedField.getName())) {
+                return Option.empty();
+              }
 
-    public ColumnIOCreatorVisitor(boolean validating, MessageType requestedSchema) {
-      this.validating = validating;
-      this.requestedSchema = requestedSchema;
+              final int fileFieldIndex = fileGroupType.getFieldIndex(requestedField.getName());
+              final Type fileField = fileGroupType.getType(fileFieldIndex);
+
+              final ColumnPath logicalPath = new ColumnPath(requestedField, ii);
+              final ColumnPath physicalPath = new ColumnPath(fileField, fileFieldIndex);
+              final LeafInfo columnLeaf = leafInfo.combine(new LeafInfo(physicalPath, logicalPath));
+
+              return create(fileField, requestedField, columnLeaf);
+            }
+          })
+          .or(new Function<Void, Option<ColumnIO<?>>>() {
+            @Override
+            public Option<ColumnIO<?>> call(Void unit) {
+              // lifted match test
+              // since there is not an exact or subtype match we will check for compatible types that require lifting
+              if (requestedField.isPrimitive()) {
+                // carry on the search, look for extraction matches next
+                return Option.empty();
+              }
+
+              final GroupType parent = requestedField.asGroupType();
+              if (parent.getFieldCount() != 1) {
+                // lifting candidates are groups with a single field
+                return Option.empty();
+              }
+
+              final Type requestedField = parent.getFields().get(0);
+              final GroupType liftedType = new GroupType(parent.getRepetition(), parent.getName(), requestedField);
+              final int repCorrections = repetitionCorrection(parent, fileGroupType);
+              final ColumnPath logicalPath = new ColumnPath(parent, ii, repCorrections, 0);
+              // leave the physical path empty
+              final LeafInfo columnLeaf = leafInfo.combine(new LeafInfo(ColumnPath.empty, logicalPath));
+
+              return groupType(
+                  fileGroupType,
+                  liftedType,
+                  columnLeaf)
+                  .map(new Function<GroupColumnIO<GroupType>, ColumnIO<?>>() {
+                    @Override
+                    public ColumnIO<?> call(final GroupColumnIO<GroupType> value) {
+                      return value;
+                    }
+                  });
+            }
+          })
+          .or(new Function<Void, Option<ColumnIO<?>>>() {
+            @Override
+            public Option<ColumnIO<?>> call(Void unit) {
+              // TODO: extracted match
+              return Option.empty();
+            }
+          })
+          .or(new Function<Void, Option<ColumnIO<?>>>() {
+            @Override
+            public Option<ColumnIO<?>> call(Void unit) {
+              if (requestedField.isPrimitive()) {
+                return Option.empty();
+              }
+
+              final GroupType renamed = requestedField.asGroupType();
+              final int repCorrections = repetitionCorrection(renamed, fileGroupType);
+              final ColumnPath logicalPath = new ColumnPath(renamed, ii, repCorrections, 0);
+              // leave the physical path empty
+              final LeafInfo columnLeaf = leafInfo.combine(new LeafInfo(ColumnPath.empty, logicalPath));
+
+              return groupType(
+                  fileGroupType,
+                  renamed,
+                  columnLeaf)
+                  .map(new Function<GroupColumnIO<GroupType>, ColumnIO<?>>() {
+                    @Override
+                    public ColumnIO<?> call(final GroupColumnIO<GroupType> value) {
+                      return value;
+                    }
+                  });
+            }
+          })
+          .map(new Function<ColumnIO<?>, Void>() {
+            @Override
+            public Void call(final ColumnIO<?> child) {
+              children.add(child);
+              return null;
+            }
+          });
     }
 
-    @Override
-    public void visit(MessageType messageType) {
-      columnIO = new MessageColumnIO(requestedSchema, validating);
-      visitChildren(columnIO, messageType, requestedSchema);
-      columnIO.setLevels();
-      columnIO.setLeaves(leaves);
+    if (children.isEmpty()) {
+      // continue searching other paths
+      return Option.empty();
     }
 
-    @Override
-    public void visit(GroupType groupType) {
-      if (currentRequestedType.isPrimitive()) {
-        incompatibleSchema(groupType, currentRequestedType);
-      }
-      GroupColumnIO newIO = new GroupColumnIO(groupType, current, currentRequestedIndex);
-      current.add(newIO);
-      visitChildren(newIO, groupType, currentRequestedType.asGroupType());
+    final ArrayList<Type> matchedTypes = new ArrayList<Type>(children.size());
+    for (final ColumnIO<?> child : children) {
+      matchedTypes.add(child.getType());
     }
 
-    private void visitChildren(GroupColumnIO newIO, GroupType groupType, GroupType requestedGroupType) {
-      GroupColumnIO oldIO = current;
-      current = newIO;
-      for (Type type : groupType.getFields()) {
-        // if the file schema does not contain the field it will just stay null
-        if (requestedGroupType.containsField(type.getName())) {
-          currentRequestedIndex = requestedGroupType.getFieldIndex(type.getName());
-          currentRequestedType = requestedGroupType.getType(currentRequestedIndex);
-          if (currentRequestedType.getRepetition().isMoreRestrictiveThan(type.getRepetition())) {
-            incompatibleSchema(type, currentRequestedType);
+    final GroupType actualType = new GroupType(
+        requestedGroupType.getRepetition(),
+        requestedGroupType.getName(),
+        matchedTypes);
+
+    return Option.pure(
+        new GroupColumnIO<GroupType>(
+            actualType,
+            actualType.getName(),
+            leafInfo,
+            Collections.unmodifiableList(children)));
+  }
+
+  Option<PrimitiveColumnIO> primitiveType(
+      final PrimitiveType fileSchema,
+      final PrimitiveType requestedSchema,
+      final LeafInfo leafInfo) {
+    if (!fileSchema.getName().equals(requestedSchema.getName())) {
+      return Option.empty();
+    }
+
+    if (!fileSchema.getPrimitiveTypeName().equals(requestedSchema.getPrimitiveTypeName())) {
+      // this would be a convenient place to check for legal widening conversions
+      return Option.empty();
+    }
+
+    if (leafInfo.getPhysicalPath().getRepetitionLevel() != leafInfo.getLogicalPath().getRepetitionLevel()) {
+      // TODO: figure out how to deal with required vs optional vs repeated?
+      return Option.empty();
+    }
+
+    if (leafInfo.getPhysicalPath().getDefinitionLevel() != leafInfo.getLogicalPath().getDefinitionLevel()) {
+      // TODO: figure out how to deal with required vs optional vs repeated?
+      return Option.empty();
+    }
+
+    return Option.pure(
+        new PrimitiveColumnIO(
+            fileSchema,
+            fileSchema.getName(),
+            leafInfo));
+  }
+
+  public Option<MessageColumnIO> messageType(
+      final MessageType fileSchema,
+      final MessageType requestedSchema) {
+    return create(fileSchema, requestedSchema, LeafInfo.empty)
+        .map(new Function<ColumnIO<?>, MessageColumnIO>() {
+          @Override
+          public MessageColumnIO call(ColumnIO<?> value) {
+            // yuck
+            value.setParent(null);
+            return (MessageColumnIO) value;
           }
-          type.accept(this);
-        }
+        });
+  }
+
+  private static int repetitionCorrection(final Type fileType, final Type requestedType) {
+    if (requestedType.getRepetition() == fileType.getRepetition() &&
+        fileType.getRepetition() == Type.Repetition.REPEATED) {
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  Option<ColumnIO<?>> create(
+      final Type fileSchema,
+      final Type requestedSchema,
+      final LeafInfo leafInfo) {
+    return requestedSchema.accept(new TypeVisitor<Option<ColumnIO<?>>>() {
+      @Override
+      public Option<ColumnIO<?>> visit(final GroupType requestedGroupType) {
+        return fileSchema.accept(new TypeVisitor<Option<ColumnIO<?>>>() {
+          @Override
+          public Option<ColumnIO<?>> visit(final GroupType fileGroupType) {
+            return groupType(fileGroupType, requestedGroupType, leafInfo)
+                .map(new Function<GroupColumnIO<GroupType>, ColumnIO<?>>() {
+                  @Override
+                  public ColumnIO<?> call(GroupColumnIO<GroupType> value) {
+                    return value;
+                  }
+                });
+          }
+
+          @Override
+          public Option<ColumnIO<?>> visit(final MessageType fileMessageType) {
+            // TODO: check to see if it needs to be wrapped in a MessageColumnIO?
+            throw new UnsupportedOperationException();
+          }
+
+          @Override
+          public Option<ColumnIO<?>> visit(final PrimitiveType filePrimitiveType) {
+            // see if there is a compatible group representation
+            return visit(new GroupType(
+                filePrimitiveType.getRepetition(),
+                filePrimitiveType.getName(),
+                new PrimitiveType(
+                    Type.Repetition.REQUIRED,
+                    filePrimitiveType.getPrimitiveTypeName(),
+                    filePrimitiveType.getTypeLength(),
+                    filePrimitiveType.getName(),
+                    filePrimitiveType.getOriginalType())));
+          }
+        });
       }
-      current = oldIO;
-    }
 
-    @Override
-    public void visit(PrimitiveType primitiveType) {
-      if (!currentRequestedType.isPrimitive() || currentRequestedType.asPrimitiveType().getPrimitiveTypeName() != primitiveType.getPrimitiveTypeName()) {
-        incompatibleSchema(primitiveType, currentRequestedType);
+      @Override
+      public Option<ColumnIO<?>> visit(final MessageType requestedMessageType) {
+        return fileSchema.accept(new TypeVisitor<Option<ColumnIO<?>>>() {
+          @Override
+          public Option<ColumnIO<?>> visit(final GroupType fileGroupType) {
+            return visit(new MessageType(
+                fileGroupType.getName(),
+                fileGroupType.getFields()));
+          }
+
+          @Override
+          public Option<ColumnIO<?>> visit(final MessageType fileMessageType) {
+            return groupType(fileMessageType, requestedMessageType, leafInfo)
+                .map(new Function<GroupColumnIO<GroupType>, ColumnIO<?>>() {
+                  @Override
+                  public ColumnIO<?> call(final GroupColumnIO<GroupType> groupColumnIO) {
+                    return new MessageColumnIO(
+                        requestedMessageType,
+                        groupColumnIO.getName(),
+                        leafInfo,
+                        groupColumnIO.getChildren());
+                  }
+                });
+          }
+
+          @Override
+          public Option<ColumnIO<?>> visit(final PrimitiveType filePrimitiveType) {
+            return Option.empty();
+          }
+        });
       }
-      PrimitiveColumnIO newIO = new PrimitiveColumnIO(primitiveType, current, currentRequestedIndex, leaves.size());
-      current.add(newIO);
-      leaves.add(newIO);
-    }
 
-    private void incompatibleSchema(Type fileType, Type requestedType) {
-      throw new ParquetDecodingException("The requested schema is not compatible with the file schema. incompatible types: " + requestedType + " != " + fileType);
-    }
+      @Override
+      public Option<ColumnIO<?>> visit(final PrimitiveType requestedPrimitiveType) {
+        return fileSchema.accept(new TypeVisitor<Option<ColumnIO<?>>>() {
+          @Override
+          public Option<ColumnIO<?>> visit(final GroupType fileGroupType) {
+            // requesting a primitive but file schema is a group
+            return Option.empty();
+          }
 
-    public MessageColumnIO getColumnIO() {
-      return columnIO;
-    }
+          @Override
+          public Option<ColumnIO<?>> visit(final MessageType fileMessageType) {
+            // requesting a primitive but file schema is a message
+            return Option.empty();
+          }
 
+          @Override
+          public Option<ColumnIO<?>> visit(final PrimitiveType filePrimitiveType) {
+            return primitiveType(filePrimitiveType, requestedPrimitiveType, leafInfo)
+                .map(new Function<PrimitiveColumnIO, ColumnIO<?>>() {
+                  @Override
+                  public ColumnIO<?> call(PrimitiveColumnIO value) {
+                    return value;
+                  }
+                });
+          }
+        });
+      }
+    });
   }
-
-  private final boolean validating;
-
-  /**
-   * validation is off by default
-   */
-  public ColumnIOFactory() {
-    this(false);
-  }
-
-  /**
-   * @param validating to turn validation on
-   */
-  public ColumnIOFactory(boolean validating) {
-    super();
-    this.validating = validating;
-  }
-
-  /**
-   * @param schema the requestedSchema we want to read/write
-   * @param fileSchema the file schema (when reading it can be different from the requested schema)
-   * @return the corresponding serializing/deserializing structure
-   */
-  public MessageColumnIO getColumnIO(MessageType requestedSchema, MessageType fileSchema) {
-    ColumnIOCreatorVisitor visitor = new ColumnIOCreatorVisitor(validating, requestedSchema);
-    fileSchema.accept(visitor);
-    return visitor.getColumnIO();
-  }
-
-  /**
-   * @param schema the schema we want to read/write
-   * @return the corresponding serializing/deserializing structure
-   */
-  public MessageColumnIO getColumnIO(MessageType schema) {
-    return this.getColumnIO(schema, schema);
-  }
-
 }

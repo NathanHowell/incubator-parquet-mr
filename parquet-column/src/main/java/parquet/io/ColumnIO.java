@@ -1,5 +1,6 @@
 /**
  * Copyright 2012 Twitter, Inc.
+ * Copyright 2014 GoDaddy, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,121 +16,72 @@
  */
 package parquet.io;
 
+import parquet.io.InvalidRecordException;
+import parquet.schema.Type;
 
-import java.util.Arrays;
 import java.util.List;
 
-import parquet.Log;
-import parquet.schema.Type;
-import parquet.schema.Type.Repetition;
-
-/**
- * a structure used to serialize deserialize records
- *
- * @author Julien Le Dem
- *
- */
-abstract public class ColumnIO {
-
-  static final boolean DEBUG = Log.DEBUG;
-
-  private final GroupColumnIO parent;
-  private final Type type;
+abstract class ColumnIO<T extends Type> {
+  private final T type;
   private final String name;
-  private final int index;
-  private int repetitionLevel;
-  private int definitionLevel;
-  private String[] fieldPath;
-  private int[] indexFieldPath;
+  private final LeafInfo leafInfo;
+  private ColumnIO<?> parent;
 
-
-  ColumnIO(Type type, GroupColumnIO parent, int index) {
+  public ColumnIO(
+      final T type,
+      final String name,
+      final LeafInfo leafInfo) {
     this.type = type;
-    this.parent = parent;
-    this.index = index;
-    this.name = type.getName();
+    this.name = name;
+    this.leafInfo = leafInfo;
   }
 
-  String[] getFieldPath() {
-    return fieldPath;
-  }
-
-  public String getFieldPath(int level) {
-    return fieldPath[level];
-  }
-
-  public int[] getIndexFieldPath() {
-    return indexFieldPath;
-  }
-
-  public int getIndexFieldPath(int level) {
-    return indexFieldPath[level];
-  }
-
-  public int getIndex() {
-    return this.index;
-  }
-
-  public String getName() {
-    return name;
-  }
-
-  int getRepetitionLevel() {
-    return repetitionLevel;
-  }
-
-  int getDefinitionLevel() {
-    return definitionLevel;
-  }
-
-  void setRepetitionLevel(int repetitionLevel) {
-    this.repetitionLevel = repetitionLevel;
-  }
-
-  void setDefinitionLevel(int definitionLevel) {
-    this.definitionLevel = definitionLevel;
-  }
-
-  void setFieldPath(String[] fieldPath, int[] indexFieldPath) {
-    this.fieldPath = fieldPath;
-    this.indexFieldPath = indexFieldPath;
-  }
-
-  public Type getType() {
+  public final T getType() {
     return type;
   }
 
-  void setLevels(int r, int d, String[] fieldPath, int[] indexFieldPath, List<ColumnIO> repetition, List<ColumnIO> path) {
-    setRepetitionLevel(r);
-    setDefinitionLevel(d);
-    setFieldPath(fieldPath, indexFieldPath);
+  public final String getName() {
+    return name;
   }
 
-  abstract List<String[]> getColumnNames();
+  public final LeafInfo getLeafInfo() {
+    return leafInfo;
+  }
 
-  public GroupColumnIO getParent() {
+  public abstract List<PrimitiveColumnIO> getLeafColumnIO();
+
+  void setParent(final ColumnIO<?> parent) {
+    this.parent = parent;
+  }
+
+  ColumnIO<?> getParent() {
     return parent;
   }
 
   abstract PrimitiveColumnIO getLast();
   abstract PrimitiveColumnIO getFirst();
 
-  ColumnIO getParent(int r) {
-    if (getRepetitionLevel() == r && getType().isRepetition(Repetition.REPEATED)) {
+  boolean isFirst() {
+    return getFirst() == this;
+  }
+
+  boolean isLast() {
+    return getLast() == this;
+  }
+
+  ColumnIO<?> getParent(int r) {
+    if (leafInfo.getLogicalPath().getRepetitionLevel() == r && getType().isRepetition(Type.Repetition.REPEATED)) {
       return this;
-    } else  if (getParent()!=null && getParent().getDefinitionLevel()>=r) {
+    } else if (parent != null && parent.leafInfo.getLogicalPath().getDefinitionLevel() >= r) {
       return getParent().getParent(r);
     } else {
-      throw new InvalidRecordException("no parent("+r+") for "+Arrays.toString(this.getFieldPath()));
+      throw new InvalidRecordException("no parent("+r+") for "+this);
     }
   }
 
   @Override
   public String toString() {
     return this.getClass().getSimpleName()+" "+type.getName()
-        +" r:"+repetitionLevel
-        +" d:"+definitionLevel
-        +" "+Arrays.toString(fieldPath);
+        +" "+leafInfo.getLogicalPath();
   }
-
 }
